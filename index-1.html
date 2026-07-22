@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#A0562F" />
+<title>La Seguia — Décompte</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; background: #FAF6EF; color: #3D3428;
+    font-family: system-ui, -apple-system, sans-serif; }
+  input, select, button, textarea { font-family: inherit; font-size: 16px; }
+  a { text-decoration: none; }
+  #root { min-height: 100vh; }
+  .spin { width: 26px; height: 26px; border: 3px solid #E7DCC9; border-top-color: #A0562F;
+    border-radius: 50%; animation: r 0.8s linear infinite; }
+  @keyframes r { to { transform: rotate(360deg); } }
+</style>
+
+<!-- Firebase (compat) -->
+<script src="https://www.gstatic.com/firebasejs/12.16.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/12.16.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore-compat.js"></script>
+<!-- React + Babel + Excel -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+<script>
+  // ---- Config Firebase du gîte (clés web = publiques par design) ----
+  const firebaseConfig = {
+    apiKey: "AIzaSyAkI-mRrTUaNmvopqsPBhNt6vaUk57rE8Y",
+    authDomain: "project-ef737d8b-e8f8-4ffb-a8c.firebaseapp.com",
+    projectId: "project-ef737d8b-e8f8-4ffb-a8c",
+    storageBucket: "project-ef737d8b-e8f8-4ffb-a8c.firebasestorage.app",
+    messagingSenderId: "307151633907",
+    appId: "1:307151633907:web:6098a22c4f97ecfe0ea686"
+  };
+  firebase.initializeApp(firebaseConfig);
+  try {
+    firebase.firestore().enablePersistence({ synchronizeTabs: true }).catch(function(){});
+  } catch (e) {}
+  window.db = firebase.firestore();
+  window.auth = firebase.auth();
+</script>
+</head>
+<body>
+<div id="root"><div style="min-height:100vh;display:grid;place-items:center"><div class="spin"></div></div></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+const db = window.db, auth = window.auth;
+
+const C = {
+  cream:"#FAF6EF", card:"#FFFFFF", ink:"#3D3428", muted:"#8A7E6B",
+  terra:"#A0562F", terraDark:"#8A4526", olive:"#7C7F4E", ochre:"#E0A44E",
+  border:"#E7DCC9", soft:"#F2EADD", danger:"#B23A2E", ok:"#5B7A45"
+};
+const CHAMBRES = ["l'Horizon", "Si 2ème compte"];
+const CATS = ["boisson","petit-déj","déjeuner","dîner","extra"];
+const CONTACT_CATS = ["urgence","médecin","taxi","propriétaire","autre"];
+const EMAIL = "laseguiabyseverine@gmail.com";
+const JOURS = ["dimanche","lundi","mardi","mercredi","jeudi","vendredi","samedi"];
+const DEFAULT_PIN = "1234";
+
+const todayISO = () => new Date().toISOString().slice(0,10);
+const jourFr = (d) => { const x = new Date(d); return isNaN(x) ? "" : JOURS[x.getDay()]; };
+const mad = (n) => (Number(n)||0).toLocaleString("fr-FR") + " MAD";
+
+/* ---------- Données d'exemple (seed au 1er lancement) ---------- */
+function seedIfEmpty() {
+  const cat = [
+    ["Eau minérale 0,5L","boisson","fixe",15],["Soda / canette","boisson","fixe",20],
+    ["Thé à la menthe","boisson","fixe",25],["Café","boisson","fixe",20],
+    ["Petit-déjeuner extra","petit-déj","fixe",80],["Déjeuner (tajine)","déjeuner","fixe",120],
+    ["Dîner","dîner","fixe",150],["Blanchisserie","extra","libre",0],
+    ["Taxi","extra","libre",0],["Extra divers","extra","libre",0]
+  ];
+  const contacts = [
+    ["Police secours","19","urgence","Standard national — à vérifier"],
+    ["Pompiers / Ambulance","15","urgence","Standard national — à vérifier"],
+    ["Gendarmerie royale","177","urgence","à vérifier"],
+    ["Médecin","","médecin","à compléter"],
+    ["Taxi","","taxi","à compléter"],
+    ["Propriétaire","","propriétaire","à compléter"]
+  ];
+  const batch = db.batch();
+  cat.forEach(([libelle,categorie,typePrix,pu]) =>
+    batch.set(db.collection("catalogue").doc(), { libelle, categorie, typePrix, pu, actif:true }));
+  contacts.forEach(([libelle,numero,categorie,note]) =>
+    batch.set(db.collection("contacts").doc(), { libelle, numero, categorie, note }));
+  batch.set(db.collection("sejours").doc(), {
+    chambre:"l'Horizon", client:"", arrivee:todayISO(), depart:"",
+    statut:"ouvert", exported:false, exportConfirmed:false, lignes:[], createdAt:Date.now()
+  });
+  batch.set(db.collection("config").doc("app"), { adminPin: DEFAULT_PIN });
+  return batch.commit();
+}
+
+/* ---------- UI de base ---------- */
+const Btn = ({children, onClick, variant="primary", disabled, style}) => {
+  const v = {
+    primary:{bg:C.terra,fg:"#fff",bd:C.terra}, olive:{bg:C.olive,fg:"#fff",bd:C.olive},
+    ghost:{bg:"transparent",fg:C.terra,bd:C.border}, danger:{bg:"transparent",fg:C.danger,bd:C.danger},
+    ok:{bg:C.ok,fg:"#fff",bd:C.ok}
+  }[variant];
+  return <button onClick={onClick} disabled={disabled} style={{
+    background:v.bg, color:v.fg, border:"1px solid "+v.bd, borderRadius:10,
+    padding:"10px 16px", fontSize:14, fontWeight:600,
+    opacity:disabled?0.4:1, cursor:disabled?"not-allowed":"pointer", ...style }}>{children}</button>;
+};
+const Field = ({label, children}) => (
+  <label style={{display:"block", marginBottom:12}}>
+    <span style={{display:"block", fontSize:12, color:C.muted, marginBottom:4}}>{label}</span>
+    {children}
+  </label>
+);
+const inS = { background:"#fff", border:"1px solid "+C.border, color:C.ink, borderRadius:10,
+  padding:"10px 12px", fontSize:16, width:"100%", outline:"none" };
+const Input = (p) => <input {...p} style={{...inS, ...(p.style||{})}} />;
+const Select = (p) => <select {...p} style={inS}>{p.children}</select>;
+const Card = ({children, style}) => (
+  <div style={{background:C.card, border:"1px solid "+C.border, borderRadius:14, padding:16, marginBottom:12, ...style}}>{children}</div>
+);
+const Modal = ({children, onClose}) => (
+  <div onClick={onClose} style={{position:"fixed", inset:0, zIndex:30, background:"rgba(0,0,0,.45)",
+    display:"flex", alignItems:"flex-end", justifyContent:"center"}}>
+    <div onClick={e=>e.stopPropagation()} style={{background:C.card, width:"100%", maxWidth:440,
+      borderTopLeftRadius:18, borderTopRightRadius:18, padding:20, maxHeight:"90vh", overflowY:"auto"}}>{children}</div>
+  </div>
+);
+
+/* ================= APP ================= */
+function App() {
+  const [authReady, setAuthReady] = useState(false);
+  const [err, setErr] = useState("");
+  const [data, setData] = useState({ catalogue:[], contacts:[], sejours:[], config:{} });
+  const [tab, setTab] = useState("saisie");
+  const [chambre, setChambre] = useState("l'Horizon");
+  const [adminOpen, setAdminOpen] = useState(false);
+  const seeded = useRef(false);
+
+  useEffect(() => {
+    auth.signInAnonymously().catch(e => setErr("Connexion refusée ("+e.code+"). Active l'auth anonyme dans Firebase."));
+    const unsub = auth.onAuthStateChanged(u => { if (u) setAuthReady(true); });
+    return unsub;
+  }, []);
+
+  useEffect(() => {
+    if (!authReady) return;
+    const subs = [];
+    const listen = (name, key) => db.collection(name).onSnapshot(
+      snap => {
+        if (name === "catalogue" && snap.empty && !seeded.current) {
+          seeded.current = true;
+          seedIfEmpty().catch(e => setErr("Écriture refusée ("+e.code+"). Publie les règles Firestore."));
+        }
+        setData(d => ({ ...d, [key]: snap.docs.map(x => ({ id:x.id, ...x.data() })) }));
+      },
+      e => setErr("Lecture refusée ("+e.code+"). Vérifie règles + auth anonyme.")
+    );
+    subs.push(listen("catalogue","catalogue"));
+    subs.push(listen("contacts","contacts"));
+    subs.push(listen("sejours","sejours"));
+    subs.push(db.collection("config").doc("app").onSnapshot(
+      doc => setData(d => ({ ...d, config: doc.exists ? doc.data() : {} })),
+      e => setErr("config: "+e.code)
+    ));
+    return () => subs.forEach(u => u());
+  }, [authReady]);
+
+  if (!authReady && !err)
+    return <div style={{minHeight:"100vh", display:"grid", placeItems:"center"}}><div className="spin"></div></div>;
+
+  return (
+    <div style={{minHeight:"100vh", paddingBottom:80}}>
+      <Header />
+      {err && <div style={{maxWidth:448, margin:"0 auto", padding:"0 16px"}}>
+        <div style={{background:"#FBEAE7", color:C.danger, border:"1px solid "+C.danger,
+          borderRadius:10, padding:"10px 12px", fontSize:13, marginTop:12}}>{err}</div>
+      </div>}
+      <div style={{maxWidth:448, margin:"0 auto", padding:"0 16px"}}>
+        {tab === "saisie" && <Saisie data={data} chambre={chambre} setChambre={setChambre} />}
+        {tab === "numeros" && <Numeros data={data} readOnly />}
+        {tab === "admin" && (adminOpen
+          ? <Admin data={data} />
+          : <PinGate config={data.config} onOk={() => setAdminOpen(true)} />)}
+      </div>
+      <TabBar tab={tab} setTab={(t)=>{ setTab(t); if(t!=="admin") setAdminOpen(false); }} />
+    </div>
+  );
+}
+
+function Header() {
+  return (
+    <div style={{position:"sticky", top:0, zIndex:10, background:C.cream, borderBottom:"1px solid "+C.border}}>
+      <div style={{maxWidth:448, margin:"0 auto", padding:"10px 16px", display:"flex", alignItems:"center", gap:12}}>
+        <div style={{width:34, height:34, borderRadius:"50%", background:C.soft, border:"1.5px solid "+C.terra,
+          display:"grid", placeItems:"center", color:C.terra, fontWeight:700, fontSize:13}}>LS</div>
+        <div>
+          <div style={{fontFamily:"Georgia, serif", letterSpacing:2, color:C.terra, fontSize:15, fontWeight:600}}>LA SEGUIA</div>
+          <div style={{fontSize:10, color:C.olive, letterSpacing:1}}>MARRAKECH · Décompte séjour</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TabBar({tab, setTab}) {
+  const items = [["saisie","Saisie"],["numeros","Numéros"],["admin","Admin"]];
+  return (
+    <div style={{position:"fixed", bottom:0, left:0, right:0, background:C.card, borderTop:"1px solid "+C.border}}>
+      <div style={{maxWidth:448, margin:"0 auto", display:"flex"}}>
+        {items.map(([k,label]) => (
+          <button key={k} onClick={()=>setTab(k)} style={{flex:1, padding:"14px 0", fontSize:14, fontWeight:600,
+            background:"transparent", border:"none", color: tab===k?C.terra:C.muted,
+            borderTop: tab===k?"2px solid "+C.terra:"2px solid transparent", cursor:"pointer"}}>{label}</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- PIN ---------- */
+function PinGate({config, onOk}) {
+  const [pin, setPin] = useState("");
+  const [bad, setBad] = useState(false);
+  const check = () => {
+    const good = (config && config.adminPin) ? config.adminPin : DEFAULT_PIN;
+    if (pin === good) onOk(); else { setBad(true); setPin(""); }
+  };
+  return (
+    <div style={{paddingTop:40}}>
+      <Card>
+        <div style={{fontFamily:"Georgia, serif", color:C.terra, fontSize:18, marginBottom:4}}>Espace admin</div>
+        <div style={{fontSize:13, color:C.muted, marginBottom:14}}>Saisis le code pour gérer le catalogue, les séjours et l'export.</div>
+        <Field label="Code PIN">
+          <Input type="password" inputMode="numeric" value={pin} autoFocus
+            onChange={e=>{setPin(e.target.value); setBad(false);}}
+            onKeyDown={e=>{ if(e.key==="Enter") check(); }} placeholder="••••" />
+        </Field>
+        {bad && <div style={{color:C.danger, fontSize:13, marginBottom:10}}>Code incorrect.</div>}
+        <Btn onClick={check} disabled={!pin} style={{width:"100%"}}>Déverrouiller</Btn>
+      </Card>
+    </div>
+  );
+}
+
+/* ---------- SAISIE ---------- */
+function Saisie({data, chambre, setChambre}) {
+  const sejour = data.sejours.find(s => s.chambre===chambre && s.statut==="ouvert");
+  const total = sejour ? sejour.lignes.reduce((a,l)=>a+(Number(l.montant)||0),0) : 0;
+
+  const ouvrir = () => db.collection("sejours").add({
+    chambre, client:"", arrivee:todayISO(), depart:"", statut:"ouvert",
+    exported:false, exportConfirmed:false, lignes:[], createdAt:Date.now()
+  });
+
+  return (
+    <div style={{paddingTop:16}}>
+      <div style={{display:"flex", gap:8, marginBottom:16}}>
+        {CHAMBRES.map(ch => (
+          <button key={ch} onClick={()=>setChambre(ch)} style={{flex:1, padding:"10px 0", borderRadius:10, fontSize:14, fontWeight:600,
+            background: chambre===ch?C.terra:C.card, color: chambre===ch?"#fff":C.ink,
+            border:"1px solid "+(chambre===ch?C.terra:C.border), cursor:"pointer"}}>{ch}</button>
+        ))}
+      </div>
+
+      {!sejour ? (
+        <Card>
+          <p style={{fontSize:14, color:C.muted, marginTop:0}}>Aucun séjour ouvert pour « {chambre} ».</p>
+          <Btn onClick={ouvrir}>Ouvrir un séjour</Btn>
+        </Card>
+      ) : (
+        <>
+          <div style={{borderRadius:14, padding:16, marginBottom:16, background:C.terra, color:"#fff"}}>
+            <div style={{fontSize:11, opacity:.85}}>Total courant · {chambre}</div>
+            <div style={{fontSize:30, fontWeight:700, fontFamily:"Georgia, serif"}}>{mad(total)}</div>
+            <div style={{fontSize:11, opacity:.85}}>{sejour.lignes.length} ligne(s) · arrivée {sejour.arrivee||"—"}</div>
+          </div>
+          <AddConso data={data} sejour={sejour} />
+          <Lignes sejour={sejour} />
+        </>
+      )}
+    </div>
+  );
+}
+
+function AddConso({data, sejour}) {
+  const actifs = data.catalogue.filter(s=>s.actif);
+  const [serviceId, setServiceId] = useState("");
+  const svc = actifs.find(s=>s.id===serviceId) || actifs[0];
+  const [qte, setQte] = useState(1);
+  const [montantLibre, setMontantLibre] = useState("");
+  const [libreLibelle, setLibreLibelle] = useState("");
+  const [note, setNote] = useState("");
+
+  const isLibre = svc && svc.typePrix==="libre";
+  const montant = isLibre ? (Number(montantLibre)||0) : (Number(svc?svc.pu:0)||0)*(Number(qte)||0);
+
+  const add = () => {
+    if (!svc) return;
+    if (isLibre && montant<=0) return;
+    const ligne = {
+      service: isLibre ? (libreLibelle || svc.libelle) : svc.libelle,
+      categorie: svc.categorie, dateHeure: new Date().toISOString(),
+      quantite: isLibre ? 1 : (Number(qte)||1), pu: isLibre ? montant : (Number(svc.pu)||0),
+      montant, auteur: "gouvernante", note: note.trim()
+    };
+    db.collection("sejours").doc(sejour.id).update({ lignes: [...sejour.lignes, ligne] });
+    setQte(1); setMontantLibre(""); setLibreLibelle(""); setNote("");
+  };
+
+  if (!actifs.length) return <Card><span style={{fontSize:13,color:C.muted}}>Catalogue vide — ajoute des services dans Admin.</span></Card>;
+
+  return (
+    <Card>
+      <div style={{fontSize:14, fontWeight:700, color:C.terra, marginBottom:12}}>Ajouter une consommation</div>
+      <Field label="Service">
+        <Select value={svc?svc.id:""} onChange={e=>setServiceId(e.target.value)}>
+          {actifs.map(s => <option key={s.id} value={s.id}>{s.libelle}{s.typePrix==="fixe" ? " · "+s.pu+" MAD" : " · montant libre"}</option>)}
+        </Select>
+      </Field>
+
+      {isLibre ? (
+        <>
+          <Field label="Libellé (optionnel)"><Input value={libreLibelle} onChange={e=>setLibreLibelle(e.target.value)} placeholder={svc.libelle} /></Field>
+          <Field label="Montant (MAD)"><Input type="number" inputMode="decimal" value={montantLibre} onChange={e=>setMontantLibre(e.target.value)} placeholder="0" /></Field>
+        </>
+      ) : (
+        <Field label="Quantité">
+          <div style={{display:"flex", alignItems:"center", gap:12}}>
+            <Btn variant="ghost" onClick={()=>setQte(q=>Math.max(1,Number(q)-1))}>−</Btn>
+            <Input type="number" inputMode="numeric" value={qte} onChange={e=>setQte(e.target.value)} style={{textAlign:"center", width:70}} />
+            <Btn variant="ghost" onClick={()=>setQte(q=>Number(q)+1)}>+</Btn>
+            <span style={{fontSize:14, color:C.muted, marginLeft:"auto"}}>= <b style={{color:C.ink}}>{mad(montant)}</b></span>
+          </div>
+        </Field>
+      )}
+
+      <Field label="Note (optionnel)"><Input value={note} onChange={e=>setNote(e.target.value)} placeholder="ex. remarque…" /></Field>
+      <Btn onClick={add} disabled={!svc || (isLibre && montant<=0)} style={{width:"100%"}}>+ Ajouter · {mad(montant)}</Btn>
+    </Card>
+  );
+}
+
+function Lignes({sejour}) {
+  const [edit, setEdit] = useState(null);
+  const write = (lignes) => db.collection("sejours").doc(sejour.id).update({ lignes });
+  const del = (idx) => write(sejour.lignes.filter((_,i)=>i!==idx));
+  const save = (idx, montant, note) => {
+    const arr = sejour.lignes.map((l,i)=> i===idx ? {...l, montant:Number(montant)||0, note} : l);
+    write(arr); setEdit(null);
+  };
+
+  if (!sejour.lignes.length)
+    return <p style={{fontSize:14, textAlign:"center", padding:"24px 0", color:C.muted}}>Aucune ligne. Ajoute une consommation ci-dessus.</p>;
+
+  return (
+    <div>
+      {sejour.lignes.map((l,idx) => (
+        <div key={idx} style={{background:C.card, border:"1px solid "+C.border, borderRadius:10,
+          padding:"8px 12px", marginBottom:8, display:"flex", alignItems:"center", gap:12}}>
+          <div style={{flex:1, minWidth:0}}>
+            <div style={{fontSize:14, fontWeight:600, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis"}}>{l.service}</div>
+            <div style={{fontSize:11, color:C.muted}}>
+              {l.categorie} · {jourFr(l.dateHeure)} {new Date(l.dateHeure).toLocaleDateString("fr-FR")}
+              {l.quantite>1 ? " · ×"+l.quantite : ""}{l.note ? " · "+l.note : ""}
+            </div>
+          </div>
+          <div style={{fontSize:14, fontWeight:700, whiteSpace:"nowrap"}}>{mad(l.montant)}</div>
+          <button onClick={()=>setEdit(idx)} style={{color:C.olive, background:"none", border:"none", fontSize:14, cursor:"pointer"}}>✎</button>
+          <button onClick={()=>del(idx)} style={{color:C.danger, background:"none", border:"none", fontSize:15, cursor:"pointer"}}>✕</button>
+        </div>
+      ))}
+      {edit!==null && (
+        <EditLigne ligne={sejour.lignes[edit]} onClose={()=>setEdit(null)} onSave={(m,n)=>save(edit,m,n)} />
+      )}
+    </div>
+  );
+}
+
+function EditLigne({ligne, onClose, onSave}) {
+  const [montant, setMontant] = useState(ligne.montant);
+  const [note, setNote] = useState(ligne.note||"");
+  return (
+    <Modal onClose={onClose}>
+      <div style={{fontSize:14, fontWeight:700, color:C.terra, marginBottom:12}}>Corriger — {ligne.service}</div>
+      <Field label="Montant (MAD)"><Input type="number" value={montant} onChange={e=>setMontant(e.target.value)} /></Field>
+      <Field label="Note"><Input value={note} onChange={e=>setNote(e.target.value)} /></Field>
+      <div style={{display:"flex", gap:8, marginTop:6}}>
+        <Btn variant="ghost" onClick={onClose} style={{flex:1}}>Annuler</Btn>
+        <Btn onClick={()=>onSave(montant, note)} style={{flex:1}}>Enregistrer</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+/* ---------- NUMÉROS ---------- */
+function Numeros({data, readOnly}) {
+  const [form, setForm] = useState(null);
+  const grouped = CONTACT_CATS.map(cat => ({cat, items:data.contacts.filter(c=>c.categorie===cat)})).filter(g=>g.items.length);
+  const save = (c) => {
+    if (c.id) { const {id, ...rest} = c; db.collection("contacts").doc(id).update(rest); }
+    else db.collection("contacts").add(c);
+    setForm(null);
+  };
+  const del = (id) => db.collection("contacts").doc(id).delete();
+
+  return (
+    <div style={{paddingTop:16}}>
+      <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12}}>
+        <h2 style={{fontFamily:"Georgia, serif", color:C.terra, fontSize:18, margin:0}}>Numéros utiles</h2>
+        {!readOnly && <Btn onClick={()=>setForm({libelle:"", numero:"", categorie:"autre", note:""})}>+ Ajouter</Btn>}
+      </div>
+      {grouped.map(g => (
+        <div key={g.cat} style={{marginBottom:16}}>
+          <div style={{fontSize:11, textTransform:"uppercase", color:C.olive, letterSpacing:1, marginBottom:4}}>{g.cat}</div>
+          {g.items.map(c => (
+            <div key={c.id} style={{background:C.card, border:"1px solid "+C.border, borderRadius:10,
+              padding:"8px 12px", marginBottom:8, display:"flex", alignItems:"center", gap:12}}>
+              <div style={{flex:1}}>
+                <div style={{fontSize:14, fontWeight:600}}>{c.libelle}</div>
+                {c.note && <div style={{fontSize:11, color:C.muted}}>{c.note}</div>}
+              </div>
+              {c.numero
+                ? <a href={"tel:"+c.numero} style={{fontSize:14, fontWeight:700, color:C.terra}}>{c.numero}</a>
+                : <span style={{fontSize:14, color:C.muted}}>—</span>}
+              {!readOnly && <>
+                <button onClick={()=>setForm(c)} style={{color:C.olive, background:"none", border:"none", cursor:"pointer"}}>✎</button>
+                <button onClick={()=>del(c.id)} style={{color:C.danger, background:"none", border:"none", cursor:"pointer"}}>✕</button>
+              </>}
+            </div>
+          ))}
+        </div>
+      ))}
+      {form && <ContactForm value={form} onClose={()=>setForm(null)} onSave={save} />}
+    </div>
+  );
+}
+
+function ContactForm({value, onClose, onSave}) {
+  const [f, setF] = useState(value);
+  const set = (k,v) => setF(o=>({...o,[k]:v}));
+  return (
+    <Modal onClose={onClose}>
+      <div style={{fontSize:14, fontWeight:700, color:C.terra, marginBottom:12}}>{value.id?"Modifier":"Nouveau"} contact</div>
+      <Field label="Libellé"><Input value={f.libelle} onChange={e=>set("libelle",e.target.value)} /></Field>
+      <Field label="Numéro"><Input value={f.numero} onChange={e=>set("numero",e.target.value)} inputMode="tel" /></Field>
+      <Field label="Catégorie"><Select value={f.categorie} onChange={e=>set("categorie",e.target.value)}>{CONTACT_CATS.map(c=><option key={c}>{c}</option>)}</Select></Field>
+      <Field label="Note (optionnel)"><Input value={f.note} onChange={e=>set("note",e.target.value)} /></Field>
+      <div style={{display:"flex", gap:8, marginTop:6}}>
+        <Btn variant="ghost" onClick={onClose} style={{flex:1}}>Annuler</Btn>
+        <Btn onClick={()=>onSave(f)} disabled={!f.libelle} style={{flex:1}}>Enregistrer</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+/* ---------- ADMIN ---------- */
+function Admin({data}) {
+  const [sub, setSub] = useState("sejours");
+  const subs = [["sejours","Séjours"],["catalogue","Catalogue"],["numeros","Numéros"],["reglages","Réglages"]];
+  return (
+    <div style={{paddingTop:16}}>
+      <div style={{display:"flex", gap:6, marginBottom:16, flexWrap:"wrap"}}>
+        {subs.map(([k,l]) => (
+          <button key={k} onClick={()=>setSub(k)} style={{flex:"1 1 22%", padding:"8px 0", borderRadius:10, fontSize:12, fontWeight:600,
+            background: sub===k?C.olive:C.card, color: sub===k?"#fff":C.ink,
+            border:"1px solid "+(sub===k?C.olive:C.border), cursor:"pointer"}}>{l}</button>
+        ))}
+      </div>
+      {sub==="sejours" && <AdminSejours data={data} />}
+      {sub==="catalogue" && <AdminCatalogue data={data} />}
+      {sub==="numeros" && <Numeros data={data} />}
+      {sub==="reglages" && <AdminReglages data={data} />}
+    </div>
+  );
+}
+
+function AdminSejours({data}) {
+  return (
+    <div>
+      <div style={{background:C.soft, color:C.terraDark, borderRadius:10, padding:"8px 12px", fontSize:12, marginBottom:12}}>
+        Clôture → export Excel → confirmation → réinitialisation débloquée.
+      </div>
+      {CHAMBRES.map(ch => <SejourCard key={ch} chambre={ch} sejour={data.sejours.find(s=>s.chambre===ch)} />)}
+    </div>
+  );
+}
+
+function exportExcel(sejour) {
+  const total = sejour.lignes.reduce((a,l)=>a+(Number(l.montant)||0),0);
+  const aoa = [
+    ["La Seguia by Séverine — Décompte séjour"],
+    ["Chambre", sejour.chambre],
+    ["Client", sejour.client||""],
+    ["Arrivée", sejour.arrivee||"", "Départ", sejour.depart||""],
+    [],
+    ["Date","Jour","Catégorie","Service","Qté","PU (MAD)","Montant (MAD)"],
+    ...sejour.lignes.map(l => [
+      new Date(l.dateHeure).toLocaleDateString("fr-FR"), jourFr(l.dateHeure),
+      l.categorie, l.service, l.quantite, l.pu, l.montant
+    ]),
+    [],
+    ["","","","","","Total séjour (MAD)", total]
+  ];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws["!cols"] = [{wch:12},{wch:10},{wch:12},{wch:22},{wch:6},{wch:10},{wch:14}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Séjour");
+  const safe = (sejour.chambre||"").replace(/[^\w]+/g,"-");
+  XLSX.writeFile(wb, "La-Seguia_"+safe+"_"+(sejour.arrivee||todayISO())+".xlsx");
+}
+
+function SejourCard({chambre, sejour}) {
+  const [editing, setEditing] = useState(false);
+  const [client, setClient] = useState(sejour ? sejour.client : "");
+  const [arrivee, setArrivee] = useState(sejour ? (sejour.arrivee||todayISO()) : todayISO());
+  const [depart, setDepart] = useState(sejour ? (sejour.depart||"") : "");
+
+  const ouvrir = () => db.collection("sejours").add({
+    chambre, client:"", arrivee:todayISO(), depart:"", statut:"ouvert",
+    exported:false, exportConfirmed:false, lignes:[], createdAt:Date.now()
+  });
+  const ref = () => db.collection("sejours").doc(sejour.id);
+  const saveInfos = () => { ref().update({client, arrivee, depart}); setEditing(false); };
+  const cloturer = () => ref().update({statut:"clôturé"});
+  const doExport = () => { exportExcel(sejour); ref().update({exported:true}); };
+  const confirm = () => ref().update({exportConfirmed:true});
+  const reset = () => { if (window.confirm("Réinitialiser « "+chambre+" » ? Les lignes seront effacées (Excel déjà exporté).")) ref().delete(); };
+
+  if (!sejour) return (
+    <Card><div style={{display:"flex", alignItems:"center", justifyContent:"space-between"}}>
+      <div><div style={{fontWeight:600, fontSize:14}}>{chambre}</div><div style={{fontSize:11, color:C.muted}}>Aucun séjour</div></div>
+      <Btn onClick={ouvrir}>Ouvrir</Btn>
+    </div></Card>
+  );
+
+  const total = sejour.lignes.reduce((a,l)=>a+(Number(l.montant)||0),0);
+  const mailto = "mailto:"+EMAIL+"?subject="+encodeURIComponent("Décompte "+chambre+" — "+(sejour.arrivee||""))
+    +"&body="+encodeURIComponent("Total séjour : "+total+" MAD.\n(Joindre le fichier Excel téléchargé.)");
+
+  return (
+    <Card>
+      <div style={{display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8}}>
+        <div>
+          <div style={{fontWeight:600, fontSize:14}}>{chambre} · <span style={{color: sejour.statut==="ouvert"?C.ok:C.muted}}>{sejour.statut}</span></div>
+          <div style={{fontSize:11, color:C.muted}}>{sejour.client||"sans nom"} · {sejour.arrivee||"—"} → {sejour.depart||"—"} · {mad(total)}</div>
+        </div>
+        <button onClick={()=>setEditing(e=>!e)} style={{color:C.olive, background:"none", border:"none", fontSize:12, cursor:"pointer"}}>{editing?"Fermer":"Infos ✎"}</button>
+      </div>
+
+      {editing && (
+        <div style={{marginBottom:8}}>
+          <Field label="Client (optionnel)"><Input value={client} onChange={e=>setClient(e.target.value)} /></Field>
+          <div style={{display:"flex", gap:8}}>
+            <div style={{flex:1}}><Field label="Arrivée"><Input type="date" value={arrivee} onChange={e=>setArrivee(e.target.value)} /></Field></div>
+            <div style={{flex:1}}><Field label="Départ"><Input type="date" value={depart} onChange={e=>setDepart(e.target.value)} /></Field></div>
+          </div>
+          <Btn onClick={saveInfos} style={{width:"100%"}}>Enregistrer les infos</Btn>
+        </div>
+      )}
+
+      {sejour.statut==="ouvert" ? (
+        <Btn variant="olive" onClick={cloturer} disabled={!sejour.lignes.length} style={{width:"100%"}}>Clôturer le séjour</Btn>
+      ) : (
+        <div>
+          <div style={{display:"flex", gap:8, marginBottom:8}}>
+            <Btn onClick={doExport} style={{flex:1}}>{sejour.exported?"Re-télécharger Excel":"Exporter Excel"}</Btn>
+            <a href={mailto} style={{flex:1, textAlign:"center", background:C.card, color:C.terra, border:"1px solid "+C.border,
+              borderRadius:10, padding:"10px 0", fontSize:14, fontWeight:600}}>E-mail</a>
+          </div>
+          {sejour.exported && !sejour.exportConfirmed &&
+            <Btn variant="ok" onClick={confirm} style={{width:"100%", marginBottom:8}}>✓ J'ai bien reçu le fichier — confirmer</Btn>}
+          <Btn variant="danger" onClick={reset} disabled={!sejour.exportConfirmed} style={{width:"100%"}}>
+            {sejour.exportConfirmed ? "Réinitialiser la chambre" : "Réinitialiser (verrouillé)"}
+          </Btn>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function AdminCatalogue({data}) {
+  const [form, setForm] = useState(null);
+  const save = (s) => {
+    if (s.id) { const {id, ...rest} = s; db.collection("catalogue").doc(id).update(rest); }
+    else db.collection("catalogue").add(s);
+    setForm(null);
+  };
+  const del = (id) => db.collection("catalogue").doc(id).delete();
+  const toggle = (s) => db.collection("catalogue").doc(s.id).update({actif: !s.actif});
+
+  return (
+    <div>
+      <div style={{background:C.soft, color:C.terraDark, borderRadius:10, padding:"8px 12px", fontSize:12, marginBottom:12}}>
+        ⚠︎ Services & prix = <b>exemples</b>. Adapte-les à ta carte réelle.
+      </div>
+      <div style={{display:"flex", justifyContent:"flex-end", marginBottom:8}}>
+        <Btn onClick={()=>setForm({libelle:"", categorie:"boisson", typePrix:"fixe", pu:0, actif:true})}>+ Service</Btn>
+      </div>
+      {CATS.map(cat => {
+        const items = data.catalogue.filter(s=>s.categorie===cat);
+        if (!items.length) return null;
+        return (
+          <div key={cat} style={{marginBottom:12}}>
+            <div style={{fontSize:11, textTransform:"uppercase", color:C.olive, letterSpacing:1, marginBottom:4}}>{cat}</div>
+            {items.map(s => (
+              <div key={s.id} style={{background:C.card, border:"1px solid "+C.border, borderRadius:10,
+                padding:"8px 12px", marginBottom:8, display:"flex", alignItems:"center", gap:8, opacity: s.actif?1:0.5}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:14, fontWeight:600}}>{s.libelle}</div>
+                  <div style={{fontSize:11, color:C.muted}}>{s.typePrix==="fixe" ? s.pu+" MAD" : "montant libre"}</div>
+                </div>
+                <button onClick={()=>toggle(s)} style={{fontSize:11, color: s.actif?C.ok:C.muted, background:"none", border:"none", cursor:"pointer"}}>{s.actif?"actif":"inactif"}</button>
+                <button onClick={()=>setForm(s)} style={{color:C.olive, background:"none", border:"none", cursor:"pointer"}}>✎</button>
+                <button onClick={()=>del(s.id)} style={{color:C.danger, background:"none", border:"none", cursor:"pointer"}}>✕</button>
+              </div>
+            ))}
+          </div>
+        );
+      })}
+      {form && <ServiceForm value={form} onClose={()=>setForm(null)} onSave={save} />}
+    </div>
+  );
+}
+
+function ServiceForm({value, onClose, onSave}) {
+  const [f, setF] = useState(value);
+  const set = (k,v) => setF(o=>({...o,[k]:v}));
+  return (
+    <Modal onClose={onClose}>
+      <div style={{fontSize:14, fontWeight:700, color:C.terra, marginBottom:12}}>{value.id?"Modifier":"Nouveau"} service</div>
+      <Field label="Libellé"><Input value={f.libelle} onChange={e=>set("libelle",e.target.value)} /></Field>
+      <Field label="Catégorie"><Select value={f.categorie} onChange={e=>set("categorie",e.target.value)}>{CATS.map(c=><option key={c}>{c}</option>)}</Select></Field>
+      <Field label="Type de prix">
+        <Select value={f.typePrix} onChange={e=>set("typePrix",e.target.value)}>
+          <option value="fixe">Prix fixe</option><option value="libre">Montant libre</option>
+        </Select>
+      </Field>
+      {f.typePrix==="fixe" && <Field label="Prix unitaire (MAD)"><Input type="number" value={f.pu} onChange={e=>set("pu",Number(e.target.value))} /></Field>}
+      <div style={{display:"flex", gap:8, marginTop:6}}>
+        <Btn variant="ghost" onClick={onClose} style={{flex:1}}>Annuler</Btn>
+        <Btn onClick={()=>onSave(f)} disabled={!f.libelle} style={{flex:1}}>Enregistrer</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+function AdminReglages({data}) {
+  const [pin, setPin] = useState((data.config && data.config.adminPin) || DEFAULT_PIN);
+  const [saved, setSaved] = useState(false);
+  const save = () => {
+    db.collection("config").doc("app").set({adminPin: pin}, {merge:true});
+    setSaved(true); setTimeout(()=>setSaved(false), 2000);
+  };
+  return (
+    <Card>
+      <div style={{fontSize:14, fontWeight:700, color:C.terra, marginBottom:12}}>Code PIN admin</div>
+      <Field label="Nouveau code"><Input inputMode="numeric" value={pin} onChange={e=>{setPin(e.target.value); setSaved(false);}} /></Field>
+      <Btn onClick={save} disabled={!pin} style={{width:"100%"}}>{saved ? "✓ Enregistré" : "Enregistrer le code"}</Btn>
+      <div style={{fontSize:12, color:C.muted, marginTop:10}}>
+        Rappel : le PIN protège l'accès à cet écran, pas la base. Note-le quelque part de sûr.
+      </div>
+    </Card>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
